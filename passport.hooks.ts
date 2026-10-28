@@ -104,7 +104,7 @@ async function pollUsage() {
     const rem = Number(win?.remaining);
     return {
       name: String(q?.name ?? "?").slice(0, 20),
-      left: Number.isFinite(rem) ? `剩 ${Math.round(rem)}%` : "--",
+      left: Number.isFinite(rem) ? `${Math.round(rem)}%` : "--",
     };
   });
 
