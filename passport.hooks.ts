@@ -1,13 +1,16 @@
 // passport.hooks.ts —— Magpie 网关钩子（唯一的 Passport 插件，已合并原
-// approval-bridge/magpie-plugin/notify.hooks.ts）：把活动与用量推送到审批桥。
+// approval-bridge/magpie-plugin/notify.hooks.ts）：把用量与任务完成提醒
+// 推送到审批桥。
 //
-// Magpie 在每次模型请求路由前调用 onRequest。本插件：
-//   1) 把 agent / model / 工作目录 作为「活动」推给桥（同组合 10 秒节流）
-//   2) 每 30 秒轮询 Magpie 的 usage 与 quotas，把 Token 消耗与剩余额度推给桥
+// Magpie 在每次模型请求/响应前后调用 onRequest / onResponse。本插件：
+//   1) 每 30 秒轮询 Magpie 的 usage 与 quotas，把 Token 消耗与剩余额度推给桥
 //      quotas 首条为 Total（各 provider 剩余百分比的平均），其后最多 3 家明细；
 //      设备首页绿卡与用量页首行显示 Total。
+//   2) 任务完成提醒：网关层没有"任务结束"事件，用空闲近似——某 agent 停止
+//      请求/响应满 3 分钟视为完成，推一条提醒；每 agent 15 分钟最多一次。
+//   3) 不推送逐次活动（太频繁，设备端已下线该类通知）。
 //
-// 隐私：只上报 agent 名、模型名、目录名与汇总数字；不上报 prompt、
+// 隐私：只上报 agent 名、模型名与汇总数字；不上报 prompt、
 // 会话 ID、账号或密钥。请求体原样返回，不做任何修改。
 //
 // 配置（环境变量，全部可选）：
@@ -20,12 +23,15 @@ const HUB = (process.env.PASSPORT_HUB || "http://127.0.0.1:7789").replace(/\/$/,
 const TOKEN = process.env.PASSPORT_TOKEN || "test123";
 const DISABLED = process.env.PASSPORT_DISABLE === "1";
 
-const THROTTLE_MS = 10_000;
 const USAGE_THROTTLE_MS = 30_000;
 const GATEWAY = process.env.MAGPIE_GATEWAY || "http://127.0.0.1:3425";
 
-const lastSeen = new Map();
-let lastUsageAt = 0;
+// 任务完成（空闲近似）参数
+const IDLE_MS = 3 * 60_000;
+const DONE_COOLDOWN_MS = 15 * 60_000;
+const lastActivity = new Map();
+const lastDoneAt = new Map();
+const idleTimers = new Map();
 
 function parseHubUrl() {
   try {
@@ -86,6 +92,8 @@ function humanTokens(n) {
   return String(Math.round(n));
 }
 
+let lastUsageAt = 0;
+
 async function pollUsage() {
   const now = Date.now();
   if (now - lastUsageAt < USAGE_THROTTLE_MS) return;
@@ -120,27 +128,34 @@ async function pollUsage() {
   await post("/usage", { tokens: humanTokens(total), quotas });
 }
 
+// 某 agent 的活动（请求/响应）到达时调用：刷新活动时间并重新武装空闲定时器。
+// 定时器到点且期间无新活动 → 推一条「已完成」提醒（带冷却，防连续误报）。
+// 设备端中文字库无「务」字，文案用「已完成」。
+function touchActivity(agent, model) {
+  const now = Date.now();
+  lastActivity.set(agent, now);
+  const old = idleTimers.get(agent);
+  if (old) clearTimeout(old);
+  idleTimers.set(agent, setTimeout(async () => {
+    idleTimers.delete(agent);
+    if (Date.now() - (lastActivity.get(agent) || 0) < IDLE_MS) return;
+    if (Date.now() - (lastDoneAt.get(agent) || 0) < DONE_COOLDOWN_MS) return;
+    lastDoneAt.set(agent, Date.now());
+    await post("/notify", {
+      agent: "magpie",
+      title: `${agent} 已完成`.slice(0, 80),
+      detail: model && model !== "?" ? `model ${model}` : "",
+      ttl_s: 10,
+    });
+  }, IDLE_MS));
+}
+
 export async function onRequest(body, ctx) {
   if (DISABLED) return undefined;
   try {
     const agent = ctx?.agent || "?";
     const model = String(ctx?.model || body?.model || "?").split("/").pop() || "?";
-    const key = `${agent}/${model}`;
-    const now = Date.now();
-    if (now - (lastSeen.get(key) ?? 0) >= THROTTLE_MS) {
-      lastSeen.set(key, now);
-      let place = "";
-      if (typeof ctx?.cwd === "string" && ctx.cwd) {
-        const parts = ctx.cwd.split("/").filter(Boolean);
-        place = parts.length ? parts[parts.length - 1] : ctx.cwd;
-      }
-      await post("/notify", {
-        agent: "magpie",
-        title: `${agent} / ${model}`.slice(0, 80),
-        detail: place ? `at ${place}` : "",
-        ttl_s: 5,
-      });
-    }
+    touchActivity(agent, model);
     pollUsage();
   } catch {
     // 上报失败绝不影响模型请求本身
@@ -148,4 +163,17 @@ export async function onRequest(body, ctx) {
   return undefined;
 }
 
-export default { onRequest };
+// 响应后同样视为活动：任务往往在最后一次响应后结束，空闲检测从这里起算
+export async function onResponse(reply, ctx) {
+  if (DISABLED) return undefined;
+  try {
+    const agent = ctx?.agent || "?";
+    const model = String(ctx?.model || reply?.model || "?").split("/").pop() || "?";
+    touchActivity(agent, model);
+  } catch {
+    // 提醒失败绝不影响响应本身
+  }
+  return undefined;
+}
+
+export default { onRequest, onResponse };
