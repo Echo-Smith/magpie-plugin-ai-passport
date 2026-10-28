@@ -1,9 +1,11 @@
-// passport.hooks.ts —— Magpie 网关钩子：把活动与用量推送到 AI Passport 审批桥。
+// passport.hooks.ts —— Magpie 网关钩子（唯一的 Passport 插件，已合并原
+// approval-bridge/magpie-plugin/notify.hooks.ts）：把活动与用量推送到审批桥。
 //
 // Magpie 在每次模型请求路由前调用 onRequest。本插件：
 //   1) 把 agent / model / 工作目录 作为「活动」推给桥（同组合 10 秒节流）
 //   2) 每 30 秒轮询 Magpie 的 usage 与 quotas，把 Token 消耗与剩余额度推给桥
-// 桥再通过局域网把这些显示在 AI Passport 设备上。
+//      quotas 首条为 Total（各 provider 剩余百分比的平均），其后最多 3 家明细；
+//      设备首页绿卡与用量页首行显示 Total。
 //
 // 隐私：只上报 agent 名、模型名、目录名与汇总数字；不上报 prompt、
 // 会话 ID、账号或密钥。请求体原样返回，不做任何修改。
@@ -98,15 +100,22 @@ async function pollUsage() {
 
   const raw = await getJson(`${GATEWAY}/v1/magpie/quotas`);
   const list = Array.isArray(raw?.data) ? raw.data : [];
-  const quotas = list.slice(0, 3).map((q) => {
+  const picks = list.map((q) => {
     const wins = Array.isArray(q?.windows) ? q.windows : [];
     const win = wins.find((w) => w?.name === "Total") ?? wins[0] ?? {};
     const rem = Number(win?.remaining);
     return {
       name: String(q?.name ?? "?").slice(0, 20),
-      left: Number.isFinite(rem) ? `${Math.round(rem)}%` : "--",
+      left: Number.isFinite(rem) ? `${Math.round(rem)}%` : null,
     };
-  });
+  }).filter((p) => p.left !== null);
+  const quotas = [];
+  if (picks.length) {
+    const avg = Math.round(
+      picks.reduce((a, p) => a + parseFloat(p.left), 0) / picks.length);
+    quotas.push({ name: "Total", left: `${avg}%` });
+  }
+  quotas.push(...picks.slice(0, 3).map((p) => ({ name: p.name, left: p.left })));
 
   await post("/usage", { tokens: humanTokens(total), quotas });
 }
