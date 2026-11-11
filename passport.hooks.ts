@@ -1,5 +1,5 @@
 // passport.hooks.ts —— Magpie 网关钩子（唯一的 Passport 插件，已合并原
-// approval-bridge/magpie-plugin/notify.hooks.ts）：把用量与任务完成提醒
+// passport-gateway/magpie-plugin/notify.hooks.ts）：把用量与任务完成提醒
 // 推送到审批桥。
 //
 // Magpie 在每次模型请求/响应前后调用 onRequest / onResponse。本插件：
